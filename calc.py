@@ -30,7 +30,30 @@
 import math
 import re
 import sys
+import time
 
+# private expression cache
+_cache = {}
+
+# public methods
+def prepare(s):
+    "Prepare the given expression 's' and return a Code object."
+    global _cache
+    if s not in _cache:
+        _cache[s] = Code.gen(Parser(s).parse())
+    return _cache[s]
+
+def run(s, d):
+    "Run the given expression 's' using the variables from 'd'."
+    return prepare(s).run(d)
+
+def flush():
+    "Clear the expression cache."
+    global _cache
+    _cache = {}
+
+# everything below here is semi-private, except the Code class, which is
+# returned from prepare().
 class Lexeme(object):
     def __init__(self, name, pos, data):
         self.name = name
@@ -44,18 +67,27 @@ class Lexer(object):
 
     def __init__(self, data):
         self.data = data
+        self.lexs = []
 
     def lexid(self, i):
         j = i + 1
-        while j < len(self.data) and self.data[j].isalnum():
-            j += 1
-        return Lexeme('id', i, self.data[i:j]), j
+        while j < len(self.data) and self.data[j].isalnum(): j += 1
+        self.lexs.append(Lexeme('id', i, self.data[i:j]))
+        return j
 
     def lexnum(self, i):
-        m = self.num_re.match(self.data, i)
-        if not m:
-            raise Exception("num error for %r at %d" % (self.data, i))
-        return Lexeme('num', i, m.group(0)), m.end()
+        j = i + 1
+        while j < len(self.data) and self.data[j].isdigit(): j += 1
+        k = j
+        if k < len(self.data) and self.data[k] == '.':
+            k += 1
+            while k < len(self.data) and self.data[k].isdigit(): k += 1
+        if k > j + 1:
+            self.lexs.append(Lexeme('num', i, self.data[i:k]))
+            return k
+        else:
+            self.lexs.append(Lexeme('num', i, self.data[i:j]))
+            return j
 
     def lex(self):
         i = 0
@@ -64,19 +96,17 @@ class Lexer(object):
             if c.isspace():
                 i += 1
             elif c.isalpha():
-                lx, i = self.lexid(i)
-                yield lx
+                i = self.lexid(i)
             elif c.isdigit():
-                lx, i = self.lexnum(i)
-                yield lx
-            elif self.data[i:i + 2] == '//':
-                yield Lexeme('//', i, '//')
+                i = self.lexnum(i)
+            elif c == '/' and self.data[i:i + 2] == '//':
+                self.lexs.append(Lexeme('//', i, '//'))
                 i += 2
             else:
-                yield Lexeme(c, i, c)
+                self.lexs.append(Lexeme(c, i, c))
                 i += 1
-        yield Lexeme('$', i, None)
-        raise StopIteration
+        self.lexs.append(Lexeme('$', i, None))
+        return self.lexs
 
 class Expr(object):
     def __init__(self, op, *args):
@@ -97,7 +127,7 @@ class Expr(object):
         else:
             return self.op
 
-class Parser2(object):
+class Parser(object):
     debug = False
 
     def error(self):
@@ -110,27 +140,23 @@ class Parser2(object):
         self.lexer = Lexer(data)
 
     def next(self):
-        if self.cur.name == '$':
-            self.error()
-        try:
-            self.cur = self.gen.next()
-        except StopIteration:
-            self.cur = Lexeme('$', -1, '$')
+        self.k += 1
+        self.cur = self.lexs[self.k]
 
     def parse(self):
-        self.gen = self.lexer.lex()
-        self.cur = self.gen.next()
+        self.k = 0
+        self.lexs = self.lexer.lex()
+        self.cur = self.lexs[0]
         return self.parseP()
 
-    def lxin(self, *names):
+    def lxin(self, names):
         return self.cur.name in names
 
+    pnames = set(['num', 'id', '(', '|', '-'])
     def parseP(self):
-        if not self.lxin('num', 'id', '(', '|', '-'): self.error()
         return self.parseE1()
 
     def parseEx(self, names, f1, f2, right=False):
-        if not self.lxin(*names): self.error()
         lhs = f1()
         lst = f2()
         if not lst:
@@ -150,36 +176,36 @@ class Parser2(object):
                 expr = Expr(lst[i], expr, lst[i + 1])
                 i += 2
             return expr
-
+    
     def parseE1(self):
-        return self.parseEx(['num', 'id', '(', '|', '-'], self.parseE2, self.parseE1_)
+        return self.parseEx(self.pnames, self.parseE2, self.parseE1_)
 
     def parseE2(self):
-        return self.parseEx(['num', 'id', '(', '|', '-'], self.parseE3, self.parseE2_)
+        return self.parseEx(self.pnames, self.parseE3, self.parseE2_)
 
+    dash = set(['-'])
+    e3names = set(['num', 'id', '(', '|'])
     def parseE3(self):
-        if self.lxin('-'):
+        if self.cur.name == '-':
             self.next()
             expr = self.parseE3()
             return Expr('-', expr)
-        elif self.lxin('num', 'id', '(', '|'):
-            return self.parseE4()
         else:
-            self.error()
+            return self.parseE4()
 
     def parseE4(self):
-        return self.parseEx(['num', 'id', '(', '|'], self.parseE5, self.parseE4_, right=True)
+        return self.parseEx(self.e3names, self.parseE5, self.parseE4_, right=True)
 
     def parseE5(self):
-        if self.lxin('num', 'id', '(', '|'):
-            expr = self.parseE6()
-            if self.parseE5_() is None:
-                return expr
-            else:
-                return Expr('!', expr)
+        expr = self.parseE6()
+        if self.parseE5_() is None:
+            return expr
         else:
-            self.error()
+            return Expr('!', expr)
 
+    lpar = set(['('])
+    pipe = set(['|'])
+    rpar = set([')'])
     def parseE6(self):
         c = self.cur
         if c.name == 'num':
@@ -195,7 +221,7 @@ class Parser2(object):
         elif c.name == '(':
             self.next()
             e1 = self.parseE1()
-            if self.lxin(')'):
+            if self.lxin(self.rpar):
                 self.next()
                 return e1
             else:
@@ -203,39 +229,39 @@ class Parser2(object):
         elif c.name == '|':
             self.next()
             e1 = self.parseE1()
-            if self.lxin('|'):
+            if self.lxin(self.pipe):
                 self.next()
                 return Expr('abs', e1)
             else:
                 self.error()
+        else:
+            self.error()
 
+    anames = set(['!', '$', '^', '*', '/', '//', '%', '+', '-', ')', '|', ','])
     def parseA(self):
-        if self.lxin('('):
+        if self.lxin(self.lpar):
             self.next()
             ll = self.parseL()
-            if self.lxin(')'):
+            if self.lxin(self.rpar):
                 self.next()
                 return ll
             else:
                 self.error()
-        elif self.lxin('!', '$', '^', '*', '/', '//', '%', '+', '-', ')', '|', ','):
+        else:
             return None
-        else:
-            self.error()
 
+    lnames = set(['num', 'id', '(', '|', '-'])
     def parseL(self):
-        if self.lxin('num', 'id', '(', '|', '-'):
-            e1 = self.parseE1()
-            l_ = self.parseL_()
-            if l_ is None:
-                return [e1]
-            else:
-                return [e1] + l_
+        e1 = self.parseE1()
+        l_ = self.parseL_()
+        if l_ is None:
+            return [e1]
         else:
-            self.error()
+            return [e1] + l_
 
+    comma = set([','])
     def parseL_(self):
-        if self.lxin(','):
+        if self.lxin(self.comma):
             self.next()
             e1 = self.parseE1()
             l_ = self.parseL_()
@@ -243,47 +269,70 @@ class Parser2(object):
                 return [e1]
             else:
                 return [e1] + l_
-        elif self.lxin(')'):
-            return None
         else:
-            self.error()
+            return None
 
     def parseEx_(self, names, skips, f1):
-        if self.lxin(*names):
+        if self.lxin(names):
             c = self.cur
             self.next()
             lhs = f1()
             lst = self.parseEx_(names, skips, f1)
             return [c.name, lhs] + lst
-        elif self.lxin(*skips):
-            return []
         else:
-            self.error()
+            return []
 
+    e1_names = set(['+', '-'])
+    e1_skips = set([')', '|', ',', '$'])
     def parseE1_(self):
-        return self.parseEx_(['+', '-'], [')', '|', ',', '$'], self.parseE2)
+        return self.parseEx_(self.e1_names, self.e1_skips, self.parseE2)
 
+    e2_names = set(['*', '/', '//', '%'])
+    e2_skips = set(['+', '-', '$', ')', '|', ','])
     def parseE2_(self):
-        return self.parseEx_(['*', '/', '//', '%'], ['+', '-', '$', ')', '|', ','], self.parseE3)
+        return self.parseEx_(self.e2_names, self.e2_skips, self.parseE3)
 
+    e4_names = set(['^'])
+    e4_skips = set(['*', '/', '//', '%', '$', '+', '-', ')', '|', ','])
     def parseE4_(self):
-        return self.parseEx_(['^'], ['*', '/', '//', '%', '$', '+', '-', ')', '|', ','], self.parseE5)
+        #return self.parseEx_(self.e4_names, self.e4_skips, self.parseE5)
+        if self.cur.name == '^':
+            self.next()
+            #lhs = self.parseE5()
+            lhs = self.parseE3()
+            lst = self.parseE4_()
+            return ['^', lhs] + lst
+        else:
+            return []
 
+    bang = set(['!'])
+    e5names = set(['^', '$', '*', '/', '//', '%', '+', '-', ')', '|', ','])
     def parseE5_(self):
-        if self.lxin('!'):
+        if self.lxin(self.bang):
             self.next()
             if self.parseE5_() is None:
                 return '!'
             else:
                 return None
-        elif self.lxin('^', '$', '*', '/', '//', '%', '+', '-', ')', '|', ','):
-            return None
         else:
-            self.error()
+            return None
 
 class Code(object):
+    # semi-private. you should probably not build these by-hand.
+    def __init__(self, f, names):
+        "Construct a Code instance from function 'f' and a list 'names'."
+        self.f = f
+        self.names = names
+
+    # public
+    def run(self, kw):
+        "Run the given Code instance using the dictionary 'kw'."
+        return self.f(kw)
+
+    # semi-private. requires knowledge of the AST structure.
     @classmethod
     def gen(cls, e):
+        "Generate a Code instance given a parse tree 'e'."
         if e.op == 'num':
             if '.' in e.args[0]:
                 n = float(e.args[0])
@@ -322,7 +371,7 @@ class Code(object):
             lhs = Code.gen(e.args[0])
             rhs = Code.gen(e.args[1])
             names = lhs.names + rhs.names
-            return cls(lambda kw: lhs.run(kw) / rhs.run(kw), names)
+            return cls(lambda kw: float(lhs.run(kw)) / rhs.run(kw), names)
         elif e.op == '%':
             lhs = Code.gen(e.args[0])
             rhs = Code.gen(e.args[1])
@@ -396,38 +445,98 @@ class Code(object):
                 raise Exception("function %r is not defined" % e.args[0])
         else:
             raise Exception("can't handle %r" % e)
-    def __init__(self, f, names):
-        self.f = f
-        self.names = names
-    def run(self, kw):
-        return self.f(kw)
 
-if __name__ == "__main__":
-    def tplize(s):
+# just for playing around or building a REPL. nothing to see here...
+class Main(object):
+    def tplize(self, s):
         k, v = s.split('=')
         if '.' in v:
             return (k, float(v))
         else:
             return (k, int(v))
 
-    s = sys.argv[1]
-    print "input: %s" % s
-    d = dict([tplize(arg) for arg in sys.argv[2:]])
+    def argdict(self):
+        return dict([self.tplize(arg) for arg in sys.argv[2:]])
+    
+    def gen(self, s):
+        return Code.gen(Parser(s).parse())
+    
+    def execute(self, s, d):
+        return self.gen(s).run(d)
+    
+    def bench(self, s, d, r):
+        print s, d, r
+        n = 10000
+    
+        t0 = time.time()
+        x = 0
+        for i in xrange(0, n):
+            x += len(Lexer(s).lex())
+        t1 = time.time()
+        print "lexed: %s ms" % (t1 - t0)
+    
+        e = Parser(s).parse()
+        t0 = time.time()
+        for i in xrange(0, n):
+            c = Code.gen(e)
+        t1 = time.time()
+        print "code-gen: %s ms" % (t1 - t0)
+    
+        t0 = time.time()
+        c = self.gen(s)
+        for i in xrange(0, n):
+            assert(c.run(d) == r)
+        t1 = time.time()
+        print "execution only: %s ms" % (t1 - t0)
+    
+        t0 = time.time()
+        for i in xrange(0, n):
+            assert(self.execute(s, d) == r)
+        t1 = time.time()
+        print "full run: %s ms" % (t1 - t0)
+    
+        print
+    
+    def cmdrun(self):
+        s = sys.argv[1]
+        print "input: %s" % s
+        d = self.argdict()
+    
+        e = Parser(s).parse()
+        print "lisp: %s" % e.lisp()
+    
+        c = Code.gen(e)
+        if c.names:
+            print "variables used: %s" % ', '.join(c.names)
+        else:
+            print "no variables"
+    
+        try:
+            r = c.run(d)
+            print "result: %r" % r
+        except KeyError, k:
+            print "missing variable: %r" % k.message
 
-    e = Parser2(s).parse()
-    print "lisp: %s" % e.lisp()
+    def main(self):
+        mode = 'run'
 
-    c = Code.gen(e)
-    if c.names:
-        print "variables used: %s" % ', '.join(c.names)
-    else:
-        print "no variables"
+        if mode == 'debug':
+            self.cmdrun()
 
-    try:
-        r = c.run(d)
-        print "result: %r" % r
-    except KeyError, k:
-        print "missing variable: %r" % k.message
+        elif mode == 'bench':
+            self.bench("1", {}, 1)
+            self.bench("1 + 1", {}, 2)
+            self.bench("1 + x", {'x': 9}, 10)
+            self.bench("1 + x * 2 + 999", {'x': 3}, 1006)
+            self.bench("1 + x * 2 + 999 / y", {'x': 1, 'y': 3}, 336)
+            self.bench("log2(2 ^ n * x)", {'n': 8, 'x': 0.5}, 7)
+            self.bench("(60 * mapLevel + 3 * mapLevel^2) / 500", {'mapLevel': 1}, 63.0 / 500)
+
+        else:
+            print run(sys.argv[1], self.argdict())
+
+if __name__ == "__main__":
+    Main().main()
 
 # Calculator Grammar:
 #
